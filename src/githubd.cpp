@@ -217,8 +217,19 @@ namespace
 	struct NotificationState
 	{
 		bool initialized = false;
-		std::unordered_set<std::string> seen;
+		std::unordered_map<std::string, std::string> seen;
+		std::unordered_set<std::string> processed_comments;
 	};
+	struct NotificationIssueState
+	{
+		bool initialized  = false;
+		bool pull_request = false;
+
+		std::string state;
+		bool merged = false;
+	};
+	std::unordered_map<std::string, NotificationIssueState>
+		notification_issue_states;
 
 	std::unordered_map<std::string, RepoState> repo_states;
 	NotificationState notification_state;
@@ -1672,99 +1683,267 @@ namespace
 	/*
 	 * ---- Notification processing ----
 	 */
-
-	bool process_comment(
+	bool get_issue_timeline(
 		CURL* curl,
 		struct curl_slist* headers,
-		const json& notification)
+		const std::string& repository,
+		int number,
+		std::vector<json>& events)
 	{
-		const auto& subject = notification["subject"];
-
-		std::string title = subject.value("title", "");
-
-		if(!subject.contains("latest_comment_url") && !subject.contains("url"))
-		{
-			return false;
-		}
-
-		const std::string type = subject.value("type", "");
-
-		if(type != "Issue" && type != "PullRequest")
-			return false;
-
-		const std::string comment_url = subject.value("latest_comment_url", "");
-
-		if(comment_url.empty())
-			return false;
-
 		GitHubResponse response;
+
+		const std::string url = "https://api.github.com/repos/"
+								+ repository
+								+ "/issues/"
+								+ std::to_string(number)
+								+ "/timeline?per_page=100";
 
 		if(!github_get(
 			   curl,
 			   headers,
-			   comment_url,
+			   url,
 			   response))
 		{
 			return false;
 		}
 
 		if(response.code != 200)
-			return false;
+		{
+			std::cerr
+				<< "Timeline API error: "
+				<< response.code
+				<< " "
+				<< repository
+				<< "#"
+				<< number
+				<< "\n"
+				<< response.body
+				<< "\n";
 
-		json comment;
+			return false;
+		}
+
+		json parsed_json;
 
 		try
 		{
-			comment = json::parse(response.body);
+			parsed_json = json::parse(response.body);
+		}
+		catch(const json::exception& e)
+		{
+			std::cerr
+				<< "Timeline JSON parse error: "
+				<< e.what()
+				<< '\n';
+
+			return false;
+		}
+
+		if(!parsed_json.is_array())
+			return false;
+
+		events.clear();
+		events.reserve(parsed_json.size());
+
+		for(const auto& event : parsed_json)
+		{
+			if(event.is_object())
+				events.push_back(event);
+		}
+
+		return true;
+	}
+	bool find_notification_event(
+		const json& notification,
+		const std::vector<json>& events,
+		json& result)
+	{
+		const auto& subject = notification["subject"];
+
+		const std::string updated_at = notification.value("updated_at", "");
+
+		if(updated_at.empty())
+			return false;
+
+		bool found = false;
+		std::string best_time;
+
+		/*
+		 * Find the latest timeline event that happened
+		 * no later than notification.updated_at.
+		 *
+		 * This works for:
+		 *
+		 *   commented
+		 *   labeled
+		 *   unlabeled
+		 *   closed
+		 *   reopened
+		 *   merged
+		 *   opened
+		 *   etc.
+		 */
+		for(const auto& event : events)
+		{
+			const std::string event_time = event.value("created_at", "");
+
+			if(event_time.empty())
+				continue;
+
+			if(event_time > updated_at)
+				continue;
+
+			if(!found || event_time > best_time)
+			{
+				found	  = true;
+				best_time = event_time;
+				result	  = event;
+			}
+		}
+
+		return found;
+	}
+	std::chrono::system_clock::time_point parse_github_time(
+		const std::string& value)
+	{
+		std::tm tm = {};
+
+		std::istringstream stream(value);
+
+		stream >> std::get_time(
+			&tm,
+			"%Y-%m-%dT%H:%M:%SZ");
+
+		if(stream.fail())
+			return {};
+
+#if defined(_WIN32)
+		return std::chrono::system_clock::from_time_t(_mkgmtime(&tm));
+#else
+		return std::chrono::system_clock::from_time_t(timegm(&tm));
+#endif
+	}
+
+	bool load_notification_issue_or_pr(
+		CURL* curl,
+		struct curl_slist* headers,
+		const json& notification,
+		std::string& repository,
+		int& number,
+		bool& pull_request,
+		std::string& title,
+		std::string& body,
+		std::string& author,
+		std::string& state,
+		bool& merged)
+	{
+		const auto& subject = notification["subject"];
+
+		const std::string type = subject.value("type", "");
+
+		if(type != "Issue" && type != "PullRequest")
+		{
+			return false;
+		}
+
+		const std::string url = subject.value("url", "");
+
+		if(url.empty())
+			return false;
+
+		const size_t slash = url.find_last_of('/');
+
+		if(slash == std::string::npos)
+			return false;
+
+		try
+		{
+			number = std::stoi(url.substr(slash + 1));
 		}
 		catch(...)
 		{
 			return false;
 		}
 
-		const std::string repository = notification["repository"]
-										   .value("full_name", "");
+		repository = notification["repository"]
+						 .value("full_name", "");
 
-		const int issue_number = std::stoi(
-			subject.value("url", "")
-				.substr(
-					subject.value("url", "").find_last_of('/') + 1));
-
-		std::string username;
-		std::string color;
-
-		if(comment.contains("user") && comment["user"].is_object())
+		if(repository.empty() || number <= 0)
 		{
-			username = comment["user"].value("login", "");
-
-			/*
-			 * GitHub users do not have a notification/text color
-			 * field in this API response. Keep it empty.
-			 */
+			return false;
 		}
 
-		const std::string message = comment.value("body", "");
+		pull_request = type == "PullRequest";
 
-		if(type == "Issue")
+		GitHubResponse response;
+
+		if(!github_get(
+			   curl,
+			   headers,
+			   url,
+			   response))
 		{
-			on_issue_comment(
-				repository,
-				issue_number,
-				title,
-				username,
-				color,
-				message);
+			return false;
 		}
-		else
+
+		if(response.code != 200)
 		{
-			on_pull_request_comment(
-				repository,
-				issue_number,
-				title,
-				username,
-				color,
-				message);
+			std::cerr
+				<< "Notification Issue/PR API error: "
+				<< response.code
+				<< " "
+				<< repository
+				<< "#"
+				<< number
+				<< '\n';
+
+			return false;
 		}
+
+		json parsed_json;
+
+		try
+		{
+			parsed_json = json::parse(
+				response.body);
+		}
+		catch(const json::exception& e)
+		{
+			std::cerr
+				<< "Notification Issue/PR JSON parse error: "
+				<< e.what()
+				<< '\n';
+
+			return false;
+		}
+
+		title = parsed_json.value(
+			"title",
+			"");
+
+		body.clear();
+
+		if(parsed_json.contains("body") && parsed_json["body"].is_string())
+		{
+			body = parsed_json["body"]
+					   .get<std::string>();
+		}
+
+		author.clear();
+
+		if(parsed_json.contains("user") && parsed_json["user"].is_object() && parsed_json["user"].contains("login") && parsed_json["user"]["login"].is_string())
+		{
+			author = parsed_json["user"]["login"]
+						 .get<std::string>();
+		}
+
+		state = parsed_json.value(
+			"state",
+			"");
+
+		merged = parsed_json.value(
+			"merged",
+			false);
 
 		return true;
 	}
@@ -1778,26 +1957,390 @@ namespace
 		const std::string type = subject.value("type", "");
 
 		if(type != "Issue" && type != "PullRequest")
+			return false;
+
+		/*
+		 * State/open/merge/etc. notification.
+		 */
+		const std::string repository = notification["repository"].value(
+			"full_name",
+			"");
+
+		const std::string subject_url = subject.value("url", "");
+
+		if(repository.empty() || subject_url.empty())
+			return false;
+
+		const size_t slash = subject_url.find_last_of('/');
+
+		if(slash == std::string::npos)
+			return false;
+
+		int number = 0;
+
+		try
+		{
+			number = std::stoi(
+				subject_url.substr(slash + 1));
+		}
+		catch(...)
 		{
 			return false;
 		}
 
-		const std::string reason = notification.value("reason", "");
+		if(number <= 0)
+			return false;
 
-		if(reason != "comment" && reason != "mention")
+		std::vector<json> events;
+
+		if(!get_issue_timeline(
+			   curl,
+			   headers,
+			   repository,
+			   number,
+			   events))
 		{
 			return false;
 		}
 
-		return process_comment(
-			curl,
-			headers,
-			notification);
+		json event;
+
+		if(!find_notification_event(
+			   notification,
+			   events,
+			   event))
+		{
+			std::cerr
+				<< "Could not find timeline event for notification "
+				<< notification.value("id", "")
+				<< " ("
+				<< repository
+				<< "#"
+				<< number
+				<< ")\n";
+
+			return false;
+		}
+
+		const std::string action = event.value("event", "");
+
+		std::string author;
+
+		if(event.contains("actor") && event["actor"].is_object())
+		{
+			author = event["actor"].value(
+				"login",
+				"");
+		}
+
+		const bool pull_request = type == "PullRequest";
+
+		std::cout
+			<< "\n=== NOTIFICATION ===\n"
+			<< repository
+			<< "#"
+			<< number
+			<< "\nType: "
+			<< type
+			<< "\nAction: "
+			<< action
+			<< "\nActor: "
+			<< author
+			<< "\n";
+
+		if(action == "commented")
+		{
+			const std::string comment_url = event.value("url", "");
+
+			if(comment_url.empty())
+				return false;
+
+			{
+				std::lock_guard<std::mutex> lock(state_mutex);
+
+				if(!notification_state.processed_comments
+						.insert(comment_url)
+						.second)
+				{
+					return true;
+				}
+			}
+
+			GitHubResponse response;
+
+			if(!github_get(
+				   curl,
+				   headers,
+				   comment_url,
+				   response))
+			{
+				return false;
+			}
+
+			if(response.code != 200)
+				return false;
+
+			json comment;
+
+			try
+			{
+				comment = json::parse(response.body);
+			}
+			catch(const json::exception&)
+			{
+				return false;
+			}
+
+			std::string username;
+
+			if(comment.contains("user") && comment["user"].is_object())
+			{
+				username = comment["user"].value(
+					"login",
+					"");
+			}
+
+			const std::string message = comment.value("body", "");
+
+			const std::string title = subject.value("title", "");
+
+			if(pull_request)
+			{
+				on_pull_request_comment(
+					repository,
+					number,
+					title,
+					username,
+					"",
+					message);
+			}
+			else
+			{
+				on_issue_comment(
+					repository,
+					number,
+					title,
+					username,
+					"",
+					message);
+			}
+
+			return true;
+		}
+		if(action == "opened")
+		{
+			std::string title;
+			std::string body;
+			std::string issue_author;
+
+			if(pull_request)
+			{
+				if(!load_pull_request(
+					   curl,
+					   headers,
+					   repository,
+					   number,
+					   title,
+					   body,
+					   issue_author))
+				{
+					return false;
+				}
+			}
+			else
+			{
+				GitHubResponse response;
+
+				const std::string url = "https://api.github.com/repos/"
+										+ repository
+										+ "/issues/"
+										+ std::to_string(number);
+
+				if(!github_get(
+					   curl,
+					   headers,
+					   url,
+					   response))
+				{
+					return false;
+				}
+
+				if(response.code != 200)
+					return false;
+
+				try
+				{
+					const json issue = json::parse(response.body);
+
+					title = issue.value(
+						"title",
+						"");
+
+					body = issue.value(
+						"body",
+						"");
+
+					if(issue.contains("user") && issue["user"].is_object())
+					{
+						issue_author = issue["user"].value(
+							"login",
+							"");
+					}
+				}
+				catch(const json::exception& e)
+				{
+					std::cerr
+						<< "Issue JSON parse error: "
+						<< e.what()
+						<< '\n';
+
+					return false;
+				}
+			}
+
+			on_issue_or_pr_created(
+				repository,
+				pull_request,
+				number,
+				title,
+				body,
+				issue_author);
+
+			return true;
+		}
+
+		if(action == "closed" || action == "reopened" || action == "merged")
+		{
+			std::string extra;
+			std::string state_action = action;
+
+			if(!pull_request && action == "closed")
+			{
+				GitHubResponse response;
+
+				const std::string url = "https://api.github.com/repos/"
+										+ repository
+										+ "/issues/"
+										+ std::to_string(number);
+
+				if(github_get(
+					   curl,
+					   headers,
+					   url,
+					   response)
+				   && response.code == 200)
+				{
+					try
+					{
+						const json issue = json::parse(response.body);
+
+						const std::string state_reason = issue.value(
+							"state_reason",
+							"");
+
+						if(state_reason == "not_planned")
+							extra = "not planned";
+						else if(state_reason == "duplicate")
+							extra = "duplicate";
+					}
+					catch(const json::exception&)
+					{
+					}
+				}
+			}
+
+			if(pull_request && action == "closed")
+			{
+				GitHubResponse response;
+
+				const std::string url = "https://api.github.com/repos/"
+										+ repository
+										+ "/pulls/"
+										+ std::to_string(number);
+
+				if(github_get(
+					   curl,
+					   headers,
+					   url,
+					   response)
+				   && response.code == 200)
+				{
+					try
+					{
+						const json pull = json::parse(response.body);
+
+						if(pull.value(
+							   "merged",
+							   false))
+						{
+							state_action = "merged";
+						}
+						else
+						{
+							const std::string state_reason = pull.value(
+								"state_reason",
+								"");
+
+							if(state_reason == "not_planned")
+								extra = "not planned";
+							else if(state_reason == "completed")
+								extra = "completed";
+						}
+					}
+					catch(const json::exception&)
+					{
+					}
+				}
+			}
+
+			on_issue_or_pr_state_change(
+				repository,
+				pull_request,
+				number,
+				author,
+				state_action,
+				extra);
+
+			return true;
+		}
+		if(action == "labeled" || action == "unlabeled")
+		{
+			LabelBatch batch;
+
+			batch.repository   = repository;
+			batch.actor		   = author;
+			batch.number	   = number;
+			batch.pull_request = pull_request;
+
+			if(!load_issue_or_pr_labels(
+				   curl,
+				   headers,
+				   repository,
+				   number,
+				   pull_request,
+				   batch.title,
+				   batch.labels))
+			{
+				return false;
+			}
+
+			on_labels_changed(
+				batch.repository,
+				batch.actor,
+				batch.title,
+				batch.number,
+				batch.pull_request,
+				batch.labels);
+
+			return true;
+		}
+
+		/*
+		 * No existing callback for this notification type.
+		 */
+		return false;
 	}
-	void parse_response(
-		CURL* curl,
-		struct curl_slist* headers,
-		const std::string& resp)
+	void parse_response(CURL* curl, struct curl_slist* headers, const std::string& resp)
 	{
 		json parsed_json;
 
@@ -1818,70 +2361,97 @@ namespace
 		if(!parsed_json.is_array())
 			return;
 
-		if(!notification_state.initialized)
-		{
-			std::lock_guard<std::mutex> lock(state_mutex);
-
-			for(const auto& notification : parsed_json)
-			{
-				const std::string id = notification.value("id", "");
-
-				if(!id.empty())
-					notification_state.seen.insert(id);
-			}
-
-			notification_state.initialized = true;
-			return;
-		}
-
 		for(const auto& notification : parsed_json)
 		{
-			const std::string id = notification.value("id", "");
+			const std::string id = notification.value(
+				"id",
+				"");
 
 			if(id.empty())
 				continue;
 
-			bool already_seen = false;
+			const std::string updated_at = notification.value(
+				"updated_at",
+				"");
+
+			bool changed = false;
 
 			{
-				std::lock_guard<std::mutex> lock(state_mutex);
+				std::lock_guard<std::mutex> lock(
+					state_mutex);
 
-				if(notification_state.seen.contains(id))
-					already_seen = true;
-				else
-					notification_state.seen.insert(id);
+				auto it = notification_state.seen.find(id);
+
+				if(it == notification_state.seen.end())
+				{
+					/*
+					 * First time we see this thread.
+					 *
+					 * Establish the cursor.
+					 */
+					notification_state.seen.emplace(
+						id,
+						updated_at);
+				}
+				else if(it->second != updated_at)
+				{
+					/*
+					 * Same thread, new notification.
+					 */
+					it->second = updated_at;
+
+					changed = true;
+				}
 			}
 
-			if(already_seen)
+			if(!changed)
 				continue;
 
-			const std::string type = notification["subject"]
-										 .value("type", "");
+			const std::string type = notification.contains("subject") && notification["subject"].is_object()
+										 ? notification["subject"].value(
+											   "type",
+											   "")
+										 : "";
 
-			if(type == "Issue" || type == "PullRequest")
+			if(type != "Issue" && type != "PullRequest")
+			{
+				continue;
+			}
+
+			try
 			{
 				process_issue_or_pr(
 					curl,
 					headers,
 					notification);
 			}
+			catch(const std::exception& e)
+			{
+				std::cerr
+					<< "Notification processing error: "
+					<< e.what()
+					<< '\n';
+			}
 		}
 
+		notification_state.initialized = true;
+
+		/*
+		 * Prevent unlimited growth.
+		 */
 		if(notification_state.seen.size() > 5000)
 		{
-			std::lock_guard<std::mutex> lock(state_mutex);
+			std::lock_guard<std::mutex> lock(
+				state_mutex);
 
-			notification_state.seen.clear();
-
-			for(const auto& notification : parsed_json)
+			while(notification_state.seen.size() > 2500)
 			{
-				const std::string id = notification.value("id", "");
-
-				if(!id.empty())
-					notification_state.seen.insert(id);
+				notification_state.seen.erase(
+					notification_state.seen.begin());
 			}
 		}
 	}
+
 	/*
 	 * ---- Main daemon ----
 	 */
