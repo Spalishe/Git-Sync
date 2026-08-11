@@ -960,6 +960,7 @@ namespace
 		const std::string& repository,
 		int number,
 		bool pull_request,
+		std::string& title,
 		std::vector<LabelInfo>& labels)
 	{
 		GitHubResponse response;
@@ -1007,6 +1008,7 @@ namespace
 			return true;
 		}
 
+		title = parsed_json.value("title", "");
 		std::unordered_set<std::string> seen;
 
 		for(const auto& label : parsed_json["labels"])
@@ -1639,6 +1641,7 @@ namespace
 				   batch.repository,
 				   batch.number,
 				   batch.pull_request,
+				   batch.title,
 				   batch.labels))
 			{
 				continue;
