@@ -212,6 +212,7 @@ namespace
 	{
 		std::string latest_event_id;
 		std::string latest_issue_event_id;
+		std::string latest_commit_sha;
 	};
 
 	struct NotificationState
@@ -1351,6 +1352,173 @@ namespace
 		}
 	}
 
+	bool update_repository_commits(
+		CURL* curl,
+		struct curl_slist* headers,
+		const std::string& repository)
+	{
+		GitHubResponse response;
+
+		const std::string url = "https://api.github.com/repos/"
+								+ repository
+								+ "/commits?per_page=100";
+
+		if(!github_get(
+			   curl,
+			   headers,
+			   url,
+			   response))
+		{
+			return false;
+		}
+
+		if(response.code != 200)
+		{
+			std::cerr
+				<< "Commits API error: "
+				<< response.code
+				<< " "
+				<< repository
+				<< "\n"
+				<< response.body
+				<< "\n";
+
+			return false;
+		}
+
+		json parsed_json;
+
+		try
+		{
+			parsed_json = json::parse(response.body);
+		}
+		catch(const json::exception& e)
+		{
+			std::cerr
+				<< "Commits JSON parse error: "
+				<< e.what()
+				<< "\n";
+
+			return false;
+		}
+
+		if(!parsed_json.is_array())
+			return false;
+
+		std::string previous_commit_sha;
+
+		{
+			std::lock_guard<std::mutex> lock(state_mutex);
+
+			previous_commit_sha = repo_states[repository].latest_commit_sha;
+		}
+
+		/*
+		 * First request:
+		 * establish the commit cursor without
+		 * generating notifications for old commits.
+		 */
+		if(previous_commit_sha.empty())
+		{
+			if(!parsed_json.empty())
+			{
+				const std::string sha = parsed_json[0].value("sha", "");
+
+				if(!sha.empty())
+				{
+					std::lock_guard<std::mutex> lock(state_mutex);
+
+					repo_states[repository].latest_commit_sha = sha;
+				}
+			}
+
+			return true;
+		}
+
+		std::vector<json> new_commits;
+
+		/*
+		 * API returns newest -> oldest.
+		 */
+		for(const auto& commit : parsed_json)
+		{
+			const std::string sha = commit.value("sha", "");
+
+			if(sha.empty())
+				continue;
+
+			if(sha == previous_commit_sha)
+				break;
+
+			new_commits.push_back(commit);
+		}
+
+		/*
+		 * Process oldest -> newest.
+		 */
+		std::reverse(
+			new_commits.begin(),
+			new_commits.end());
+
+		for(const auto& commit_event : new_commits)
+		{
+			const std::string sha = commit_event.value("sha", "");
+
+			if(sha.empty())
+				continue;
+
+			CommitInfo commit;
+
+			if(!get_commit(
+				   curl,
+				   headers,
+				   repository,
+				   sha,
+				   commit))
+			{
+				continue;
+			}
+
+			PushInfo push;
+
+			if(commit_event.contains("author")
+			   && commit_event["author"].is_object())
+			{
+				push.actor = commit_event["author"].value(
+					"login",
+					"");
+			}
+
+			/*
+			 * /commits does not provide a push event's
+			 * branch information in the same way as
+			 * PushEvent.
+			 *
+			 * Leave it empty for now.
+			 */
+			push.branch.clear();
+
+			push.commits.push_back(
+				std::move(commit));
+
+			on_commits(
+				repository,
+				push);
+		}
+
+		/*
+		 * Advance cursor to newest commit.
+		 */
+		{
+			std::lock_guard<std::mutex> lock(state_mutex);
+
+			repo_states[repository].latest_commit_sha = parsed_json[0].value(
+				"sha",
+				"");
+		}
+
+		return true;
+	}
 	bool update_repository_events(
 		CURL* curl,
 		struct curl_slist* headers,
@@ -1438,7 +1606,7 @@ namespace
 
 			const std::string type = event.value("type", "");
 
-			if(type == "PushEvent" || type == "IssuesEvent" || type == "PullRequestEvent" || type == "IssueCommentEvent")
+			if(type == "IssuesEvent" || type == "PullRequestEvent" || type == "IssueCommentEvent")
 			{
 				new_events.push_back(event);
 			}
@@ -1557,79 +1725,6 @@ namespace
 					}
 
 					continue;
-				}
-
-				if(type != "PushEvent")
-					continue;
-
-				if(!event.contains("payload"))
-					continue;
-
-				const auto& payload = event["payload"];
-
-				const std::string before = payload.value("before", "");
-
-				const std::string head = payload.value("head", "");
-
-				if(before.empty() || head.empty())
-				{
-					continue;
-				}
-
-				/*
-				 * Branch name:
-				 * refs/heads/master -> master
-				 */
-				std::string branch = payload.value("ref", "");
-
-				const std::string prefix = "refs/heads/";
-
-				if(branch.rfind(prefix, 0) == 0)
-					branch.erase(
-						0,
-						prefix.size());
-
-				PushInfo push;
-
-				push.actor = event["actor"].value("login", "");
-
-				push.branch = branch;
-
-				/*
-				 * A zero "before" means this is the first commit
-				 * on a newly created branch.
-				 */
-				if(before == "0000000000000000000000000000000000000000")
-				{
-					CommitInfo commit;
-
-					if(get_commit(
-						   curl,
-						   headers,
-						   repository,
-						   head,
-						   commit))
-					{
-						push.commits.push_back(
-							std::move(commit));
-					}
-				}
-				else
-				{
-					get_push_commits(
-						curl,
-						headers,
-						repository,
-						before,
-						head,
-						push.commits);
-				}
-
-				if(!push.commits.empty())
-				{
-					on_commits(
-						repository,
-						push);
 				}
 			}
 			catch(const json::exception& e)
@@ -2566,6 +2661,11 @@ namespace
 							break;
 
 						update_repository_events(
+							curl,
+							headers,
+							repository);
+
+						update_repository_commits(
 							curl,
 							headers,
 							repository);
