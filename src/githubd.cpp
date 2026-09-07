@@ -2671,7 +2671,7 @@ namespace
 							repository);
 					}
 
-					next_repositories = now + std::chrono::seconds(random_seconds(20, 25));
+					next_repositories = now + std::chrono::seconds(random_seconds(60, 75));
 				}
 
 				/*
@@ -2729,7 +2729,7 @@ namespace
 						}
 					}
 
-					const int requested_interval = random_seconds(20, 25);
+					const int requested_interval = random_seconds(60, 75);
 
 					const int actual_interval = std::max(
 						requested_interval,
